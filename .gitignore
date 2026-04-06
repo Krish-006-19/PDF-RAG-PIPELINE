@@ -46,12 +46,6 @@ build/
 dist/
 *.egg-info/
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# Coverage reports
-coverage.xml
-
 # Temporary files
 *.tmp
 *.swp
