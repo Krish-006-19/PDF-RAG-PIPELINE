@@ -1,12 +1,22 @@
 import uuid
 
 from huggingface_hub import InferenceClient
-from langchain_chroma import Chroma
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
+from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pinecone import Pinecone, ServerlessSpec
 
-from settings import get_hf_token
+from settings import (
+    get_hf_token,
+    get_pinecone_api_key,
+    get_pinecone_cloud,
+    get_pinecone_dimension,
+    get_pinecone_index_name,
+    get_pinecone_metric,
+    get_pinecone_namespace,
+    get_pinecone_region,
+)
 
 HF_TOKEN = get_hf_token()
 
@@ -16,12 +26,68 @@ embeddings = HuggingFaceEndpointEmbeddings(
     huggingfacehub_api_token=HF_TOKEN,
 )
 
-# Vector DB
-vectorstore = Chroma(
-    collection_name="admin_docs",
-    persist_directory="./chroma_db",
-    embedding_function=embeddings,
-)
+
+_vectorstore: PineconeVectorStore | None = None
+
+
+def _pinecone_index_host(pc: Pinecone, index_name: str) -> str:
+    desc = pc.describe_index(index_name)
+    host = getattr(desc, "host", None)
+    if host:
+        return host
+    if isinstance(desc, dict) and desc.get("host"):
+        return str(desc["host"])
+    status = getattr(desc, "status", None)
+    raise RuntimeError(
+        "Unable to determine Pinecone index host (index may still be provisioning). "
+        f"index_name={index_name!r} status={status!r}"
+    )
+
+
+def _ensure_pinecone_index(pc: Pinecone, index_name: str) -> None:
+    metric = get_pinecone_metric()
+    dimension = get_pinecone_dimension()
+    cloud = get_pinecone_cloud()
+    region = get_pinecone_region()
+
+    try:
+        names = set(pc.list_indexes().names())
+    except Exception:
+        indexes = pc.list_indexes()
+        names = set(getattr(indexes, "names", lambda: [])())
+
+    if index_name in names:
+        return
+
+    pc.create_index(
+        name=index_name,
+        dimension=dimension,
+        metric=metric,
+        spec=ServerlessSpec(cloud=cloud, region=region),
+    )
+
+
+def _get_vectorstore() -> PineconeVectorStore:
+    global _vectorstore
+    if _vectorstore is not None:
+        return _vectorstore
+
+    api_key = get_pinecone_api_key()
+    index_name = get_pinecone_index_name()
+    namespace = get_pinecone_namespace()
+
+    pc = Pinecone(api_key=api_key)
+    _ensure_pinecone_index(pc, index_name)
+    host = _pinecone_index_host(pc, index_name)
+
+    _vectorstore = PineconeVectorStore(
+        index_name=index_name,
+        host=host,
+        pinecone_api_key=api_key,
+        namespace=namespace,
+        embedding=embeddings,
+    )
+    return _vectorstore
 
 # Hugging Face
 llm_client = InferenceClient(
@@ -31,7 +97,7 @@ llm_client = InferenceClient(
 
 # Text Splitter
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=700,
+    chunk_size=300,
     chunk_overlap=100,
 )
 
@@ -60,18 +126,6 @@ Answer:
 )
 
 
-def _maybe_persist() -> None:
-    persist_fn = getattr(vectorstore, "persist", None)
-    if callable(persist_fn):
-        persist_fn()
-        return
-
-    client = getattr(vectorstore, "_client", None)
-    client_persist = getattr(client, "persist", None)
-    if callable(client_persist):
-        client_persist()
-
-
 def index_admin_document(text: str, link: str) -> dict:
     chunks = text_splitter.split_text(text)
 
@@ -81,13 +135,13 @@ def index_admin_document(text: str, link: str) -> dict:
     ids = [str(uuid.uuid4()) for _ in chunks]
     metadatas = [{"link": link} for _ in chunks]
 
+    vectorstore = _get_vectorstore()
+
     vectorstore.add_texts(
         texts=chunks,
         metadatas=metadatas,
         ids=ids,
     )
-
-    _maybe_persist()
 
     return {
         "message": "Document indexed successfully",
@@ -97,6 +151,7 @@ def index_admin_document(text: str, link: str) -> dict:
 
 
 def answer_user_query(query: str) -> dict:
+    vectorstore = _get_vectorstore()
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={"k": 4},
