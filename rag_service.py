@@ -245,9 +245,16 @@ HF_TOKEN = get_hf_token()
 # =========================================================
 # EMBEDDINGS
 # =========================================================
+# Upgraded from MiniLM -> BGE Small
+# Much better retrieval quality for:
+# - schedules
+# - notices
+# - roll numbers
+# - structured college documents
+# =========================================================
 
 embeddings = HuggingFaceEndpointEmbeddings(
-    repo_id="sentence-transformers/all-MiniLM-L6-v2",
+    repo_id="BAAI/bge-small-en-v1.5",
     huggingfacehub_api_token=HF_TOKEN,
 )
 
@@ -256,6 +263,7 @@ EMBEDDING_DIMENSION = len(
 )
 
 print(f"Embedding Dimension: {EMBEDDING_DIMENSION}")
+# BGE Small = 384
 
 # =========================================================
 # VECTORSTORE CACHE
@@ -268,7 +276,7 @@ _vectorstore: PineconeVectorStore | None = None
 # =========================================================
 
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1200,
+    chunk_size=1400,
     chunk_overlap=250,
 )
 
@@ -279,21 +287,27 @@ text_splitter = RecursiveCharacterTextSplitter(
 qa_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template="""
-You are a college document assistant.
+You are a precise college document assistant.
 
 You MUST answer ONLY from the provided context.
 
 Rules:
-1. Use only information present in the context.
-2. Simple reasoning based on tables, schedules,
-   roll-number ranges, mappings, and structured
-   data is allowed.
+1. Use only information from the context.
+2. Reasoning over:
+   - roll number ranges
+   - schedules
+   - tables
+   - mappings
+   - timings
+   is allowed.
 3. Do NOT use outside knowledge.
-4. Keep answers concise and accurate.
-5. If the answer truly does not exist in the context,
-   reply exactly:
+4. Keep answers concise and direct.
+5. If the answer truly does not exist
+   in the context, reply exactly:
 Answer not found in uploaded documents please try a different query
-6. Do not fabricate information.
+6. Never fabricate information.
+7. If a roll number belongs to a range,
+   infer the correct corresponding slot.
 
 Context:
 {context}
@@ -310,19 +324,22 @@ Answer:
 # =========================================================
 
 def clean_query(query: str) -> str:
-    """
-    Convert noisy student queries into
-    retrieval-friendly queries.
-    """
 
-    query = query.lower()
+    query = query.lower().strip()
 
-    # Extract roll number
+    # normalize whitespace
+    query = re.sub(r"\s+", " ", query)
+
+    # roll number optimization
     roll_match = re.search(r"\b\d+\b", query)
 
     if roll_match:
         roll = roll_match.group()
-        return f"roll number {roll} lab exam timing"
+
+        return (
+            f"roll number {roll} "
+            f"lab exam schedule timing"
+        )
 
     return query
 
@@ -381,6 +398,7 @@ def _ensure_pinecone_index(
 # =========================================================
 
 def _get_vectorstore() -> PineconeVectorStore:
+
     global _vectorstore
 
     if _vectorstore is not None:
@@ -392,7 +410,10 @@ def _get_vectorstore() -> PineconeVectorStore:
 
     pc = Pinecone(api_key=api_key)
 
-    _ensure_pinecone_index(pc, index_name)
+    _ensure_pinecone_index(
+        pc,
+        index_name,
+    )
 
     host = _pinecone_index_host(
         pc,
@@ -412,11 +433,22 @@ def _get_vectorstore() -> PineconeVectorStore:
 # =========================================================
 # LLM
 # =========================================================
+# Upgraded from old Mistral 7B
+# -> Qwen2.5 7B Instruct
+#
+# Better:
+# - instruction following
+# - RAG behavior
+# - table understanding
+# - structured reasoning
+# =========================================================
 
 llm_client = InferenceClient(
     provider="featherless-ai",
     api_key=HF_TOKEN,
 )
+
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 
 # =========================================================
 # INDEX DOCUMENT
@@ -430,9 +462,12 @@ def index_admin_document(
     print("\n=========== RAW DOCUMENT TEXT ===========\n")
     print(text)
 
-    # Small notices/schedules should NOT be chunked
+    text = text.strip()
+
+    # Very small docs should remain whole
     if len(text) < 3000:
         chunks = [text]
+
     else:
         chunks = text_splitter.split_text(text)
 
@@ -461,6 +496,12 @@ def index_admin_document(
         ids=ids,
     )
 
+    print("\n=========== CHUNKS INDEXED ===========")
+
+    for i, chunk in enumerate(chunks):
+        print(f"\n--- CHUNK {i+1} ---")
+        print(chunk)
+
     return {
         "message": "Document indexed successfully",
         "chunks_added": len(chunks),
@@ -483,10 +524,13 @@ def answer_user_query(query: str) -> dict:
     print("\n=========== CLEANED QUERY ===========")
     print(cleaned_query)
 
-    # Debug similarity scores
+    # =====================================================
+    # RETRIEVAL
+    # =====================================================
+
     results = vectorstore.similarity_search_with_score(
         cleaned_query,
-        k=5,
+        k=6,
     )
 
     print("\n=========== RETRIEVED RESULTS ===========")
@@ -496,7 +540,7 @@ def answer_user_query(query: str) -> dict:
     for i, (doc, score) in enumerate(results):
 
         print(f"\n--- RESULT {i+1} ---")
-        print(f"Score: {score}")
+        print(f"SIMILARITY SCORE: {score}")
         print(doc.page_content)
 
         docs.append(doc)
@@ -504,12 +548,16 @@ def answer_user_query(query: str) -> dict:
     if not docs:
         return {
             "ans": (
-                "Answer not found in uploaded documents "
-                "please try a different query"
+                "Answer not found in uploaded "
+                "documents please try a different query"
             ),
             "link": None,
             "sources": [],
         }
+
+    # =====================================================
+    # CONTEXT BUILDING
+    # =====================================================
 
     context = "\n\n".join(
         doc.page_content
@@ -521,15 +569,18 @@ def answer_user_query(query: str) -> dict:
         question=query,
     )
 
+    # =====================================================
+    # LLM CALL
+    # =====================================================
+
     response = llm_client.chat.completions.create(
-        model="mistralai/Mistral-7B-Instruct-v0.2",
+        model=MODEL_NAME,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "You are a retrieval-based college "
-                    "assistant. Answer ONLY using "
-                    "the provided document context."
+                    "You are a precise retrieval-based "
+                    "college assistant."
                 ),
             },
             {
@@ -537,8 +588,8 @@ def answer_user_query(query: str) -> dict:
                 "content": final_prompt,
             },
         ],
-        temperature=0.1,
-        max_tokens=512,
+        temperature=0.05,
+        max_tokens=300,
     )
 
     answer = (
@@ -547,17 +598,24 @@ def answer_user_query(query: str) -> dict:
         .strip()
     )
 
+    print("\n=========== FINAL ANSWER ===========")
+    print(answer)
+
     reference_link = (
         docs[0].metadata or {}
     ).get("link")
+
+    # =====================================================
+    # SAFETY FALLBACK
+    # =====================================================
 
     if (
         not answer
         or "Answer not found" in answer
     ):
         answer = (
-            "Answer not found in uploaded documents "
-            "please try a different query"
+            "Answer not found in uploaded "
+            "documents please try a different query"
         )
 
     return {
