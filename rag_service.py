@@ -102,19 +102,46 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 # Prompt
+# qa_prompt = PromptTemplate(
+#     input_variables=["context", "question"],
+#     template="""
+# You are a strict retrieval assistant.
+
+# Rules:
+# Dont even try to answer questions that are out of the scope of the documents, however if you encounter such a query then simply reply like this and then simply stop, no need to follow the rest of the prompt:
+# Answer not found in uploaded documents please try a different query
+# 1. Use only the provided context.
+# 2. Do not use outside knowledge.
+# 3. If the answer is not explicitly present in the context, reply exactly:
+# Answer not found in uploaded documents please try a different query
+# 4. Do not guess, infer, or partially answer.
+# Context:
+# {context}
+
+# Question:
+# {question}
+
+# Answer:
+# """,
+# )
+
 qa_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template="""
-You are a strict retrieval assistant.
+You are a retrieval-based assistant.
 
 Rules:
-Dont even try to answer questions that are out of the scope of the documents, however if you encounter such a query then simply reply like this and then simply stop, no need to follow the rest of the prompt:
-Answer not found in uploaded documents please try a different query
 1. Use only the provided context.
 2. Do not use outside knowledge.
-3. If the answer is not explicitly present in the context, reply exactly:
+3. Simple reasoning based on the context is allowed.
+   Examples:
+   - If a roll number falls within a range, use that range.
+   - If data is presented in tables or mappings, interpret them correctly.
+4. Only reply with:
 Answer not found in uploaded documents please try a different query
-4. Do not guess, infer, or partially answer.
+if the required information truly does not exist in the context.
+5. Keep answers concise and direct.
+
 Context:
 {context}
 
