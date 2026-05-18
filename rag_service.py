@@ -128,19 +128,17 @@ text_splitter = RecursiveCharacterTextSplitter(
 qa_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template="""
-You are a retrieval-based assistant.
+You are a college document assistant.
+
+Answer ONLY using the provided context.
 
 Rules:
-1. Use only the provided context.
-2. Do not use outside knowledge.
-3. Simple reasoning based on the context is allowed.
-   Examples:
-   - If a roll number falls within a range, use that range.
-   - If data is presented in tables or mappings, interpret them correctly.
-4. Only reply with:
+1. Use only information present in the context.
+2. Simple reasoning based on tables, ranges, schedules, and mappings is allowed.
+3. Keep answers concise and accurate.
+4. If the answer truly cannot be found in the context, reply exactly:
 Answer not found in uploaded documents please try a different query
-if the required information truly does not exist in the context.
-5. Keep answers concise and direct.
+5. Do not invent information.
 
 Context:
 {context}
