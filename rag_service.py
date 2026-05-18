@@ -220,6 +220,7 @@
 #         "link": reference_link,
 #     }
 
+import re
 import uuid
 
 from huggingface_hub import InferenceClient
@@ -233,7 +234,6 @@ from settings import (
     get_hf_token,
     get_pinecone_api_key,
     get_pinecone_cloud,
-    get_pinecone_dimension,
     get_pinecone_index_name,
     get_pinecone_metric,
     get_pinecone_namespace,
@@ -251,9 +251,11 @@ embeddings = HuggingFaceEndpointEmbeddings(
     huggingfacehub_api_token=HF_TOKEN,
 )
 
-print("Embedding Dimension:", len(embeddings.embed_query("test")))
-# Should print 384
+EMBEDDING_DIMENSION = len(
+    embeddings.embed_query("test")
+)
 
+print(f"Embedding Dimension: {EMBEDDING_DIMENSION}")
 
 # =========================================================
 # VECTORSTORE CACHE
@@ -261,12 +263,78 @@ print("Embedding Dimension:", len(embeddings.embed_query("test")))
 
 _vectorstore: PineconeVectorStore | None = None
 
+# =========================================================
+# TEXT SPLITTER
+# =========================================================
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1200,
+    chunk_overlap=250,
+)
+
+# =========================================================
+# PROMPT
+# =========================================================
+
+qa_prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template="""
+You are a college document assistant.
+
+You MUST answer ONLY from the provided context.
+
+Rules:
+1. Use only information present in the context.
+2. Simple reasoning based on tables, schedules,
+   roll-number ranges, mappings, and structured
+   data is allowed.
+3. Do NOT use outside knowledge.
+4. Keep answers concise and accurate.
+5. If the answer truly does not exist in the context,
+   reply exactly:
+Answer not found in uploaded documents please try a different query
+6. Do not fabricate information.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+""",
+)
+
+# =========================================================
+# QUERY CLEANING
+# =========================================================
+
+def clean_query(query: str) -> str:
+    """
+    Convert noisy student queries into
+    retrieval-friendly queries.
+    """
+
+    query = query.lower()
+
+    # Extract roll number
+    roll_match = re.search(r"\b\d+\b", query)
+
+    if roll_match:
+        roll = roll_match.group()
+        return f"roll number {roll} lab exam timing"
+
+    return query
 
 # =========================================================
 # PINECONE HELPERS
 # =========================================================
 
-def _pinecone_index_host(pc: Pinecone, index_name: str) -> str:
+def _pinecone_index_host(
+    pc: Pinecone,
+    index_name: str,
+) -> str:
+
     desc = pc.describe_index(index_name)
 
     host = getattr(desc, "host", None)
@@ -274,28 +342,33 @@ def _pinecone_index_host(pc: Pinecone, index_name: str) -> str:
     if host:
         return host
 
-    if isinstance(desc, dict) and desc.get("host"):
-        return str(desc["host"])
+    if isinstance(desc, dict):
+        return desc.get("host")
 
     raise RuntimeError(
-        f"Unable to determine Pinecone host for index: {index_name}"
+        f"Unable to determine host for index: {index_name}"
     )
 
 
-def _ensure_pinecone_index(pc: Pinecone, index_name: str) -> None:
+def _ensure_pinecone_index(
+    pc: Pinecone,
+    index_name: str,
+) -> None:
+
     metric = get_pinecone_metric()
-    dimension = get_pinecone_dimension()
     cloud = get_pinecone_cloud()
     region = get_pinecone_region()
 
-    existing_indexes = set(pc.list_indexes().names())
+    existing_indexes = set(
+        pc.list_indexes().names()
+    )
 
     if index_name in existing_indexes:
         return
 
     pc.create_index(
         name=index_name,
-        dimension=dimension,
+        dimension=EMBEDDING_DIMENSION,
         metric=metric,
         spec=ServerlessSpec(
             cloud=cloud,
@@ -303,6 +376,9 @@ def _ensure_pinecone_index(pc: Pinecone, index_name: str) -> None:
         ),
     )
 
+# =========================================================
+# VECTORSTORE
+# =========================================================
 
 def _get_vectorstore() -> PineconeVectorStore:
     global _vectorstore
@@ -318,7 +394,10 @@ def _get_vectorstore() -> PineconeVectorStore:
 
     _ensure_pinecone_index(pc, index_name)
 
-    host = _pinecone_index_host(pc, index_name)
+    host = _pinecone_index_host(
+        pc,
+        index_name,
+    )
 
     _vectorstore = PineconeVectorStore(
         index_name=index_name,
@@ -330,7 +409,6 @@ def _get_vectorstore() -> PineconeVectorStore:
 
     return _vectorstore
 
-
 # =========================================================
 # LLM
 # =========================================================
@@ -340,60 +418,33 @@ llm_client = InferenceClient(
     api_key=HF_TOKEN,
 )
 
-
-# =========================================================
-# TEXT SPLITTER
-# =========================================================
-
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200,
-)
-
-
-# =========================================================
-# PROMPT
-# =========================================================
-
-qa_prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""
-You are a college document assistant.
-
-You MUST answer ONLY from the provided context.
-
-Rules:
-1. Use only information present in the context.
-2. Simple reasoning based on tables, schedules, roll-number ranges,
-   mappings, and structured data is allowed.
-3. Do NOT use outside knowledge.
-4. Keep answers concise and accurate.
-5. If the answer truly does not exist in the context, reply exactly:
-Answer not found in uploaded documents please try a different query
-6. Do not fabricate information.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-""",
-)
-
-
 # =========================================================
 # INDEX DOCUMENT
 # =========================================================
 
-def index_admin_document(text: str, link: str) -> dict:
-    chunks = text_splitter.split_text(text)
+def index_admin_document(
+    text: str,
+    link: str,
+) -> dict:
+
+    print("\n=========== RAW DOCUMENT TEXT ===========\n")
+    print(text)
+
+    # Small notices/schedules should NOT be chunked
+    if len(text) < 3000:
+        chunks = [text]
+    else:
+        chunks = text_splitter.split_text(text)
 
     if not chunks:
-        raise ValueError("No valid text found")
+        raise ValueError(
+            "No valid text found"
+        )
 
-    ids = [str(uuid.uuid4()) for _ in chunks]
+    ids = [
+        str(uuid.uuid4())
+        for _ in chunks
+    ]
 
     metadatas = [
         {
@@ -416,34 +467,53 @@ def index_admin_document(text: str, link: str) -> dict:
         "link": link,
     }
 
-
 # =========================================================
 # ANSWER QUERY
 # =========================================================
 
 def answer_user_query(query: str) -> dict:
+
     vectorstore = _get_vectorstore()
 
-    retriever = vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={
-            "k": 6,
-            "fetch_k": 20,
-            "lambda_mult": 0.7,
-        },
+    cleaned_query = clean_query(query)
+
+    print("\n=========== ORIGINAL QUERY ===========")
+    print(query)
+
+    print("\n=========== CLEANED QUERY ===========")
+    print(cleaned_query)
+
+    # Debug similarity scores
+    results = vectorstore.similarity_search_with_score(
+        cleaned_query,
+        k=5,
     )
 
-    docs = retriever.invoke(query)
+    print("\n=========== RETRIEVED RESULTS ===========")
+
+    docs = []
+
+    for i, (doc, score) in enumerate(results):
+
+        print(f"\n--- RESULT {i+1} ---")
+        print(f"Score: {score}")
+        print(doc.page_content)
+
+        docs.append(doc)
 
     if not docs:
         return {
-            "ans": "Answer not found in uploaded documents please try a different query",
+            "ans": (
+                "Answer not found in uploaded documents "
+                "please try a different query"
+            ),
             "link": None,
             "sources": [],
         }
 
     context = "\n\n".join(
-        doc.page_content for doc in docs
+        doc.page_content
+        for doc in docs
     )
 
     final_prompt = qa_prompt.format(
@@ -457,8 +527,9 @@ def answer_user_query(query: str) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "You are a retrieval-based college assistant. "
-                    "Answer ONLY using the provided document context."
+                    "You are a retrieval-based college "
+                    "assistant. Answer ONLY using "
+                    "the provided document context."
                 ),
             },
             {
@@ -470,19 +541,23 @@ def answer_user_query(query: str) -> dict:
         max_tokens=512,
     )
 
-    answer = response.choices[0].message.content.strip()
+    answer = (
+        response.choices[0]
+        .message.content
+        .strip()
+    )
 
     reference_link = (
         docs[0].metadata or {}
     ).get("link")
 
-    # Optional fallback safety
     if (
         not answer
         or "Answer not found" in answer
     ):
         answer = (
-            "Answer not found in uploaded documents please try a different query"
+            "Answer not found in uploaded documents "
+            "please try a different query"
         )
 
     return {
