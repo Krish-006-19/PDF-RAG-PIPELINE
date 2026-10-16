@@ -124,7 +124,8 @@ You MUST answer ONLY from the provided context.
 7. Distinguish between information explicitly stated in the lectures and conclusions derived through straightforward reasoning from that information.
 8. Do not provide investment recommendations, fund selections, buy/sell signals, guaranteed return predictions, or personalized financial advice. MFD is an educational paper-trading platform, not an investment advisory service.
 9. If the context does not contain enough information to answer the question, do not guess or fill gaps using your pretrained knowledge.
-10. If absolutely no relevant information exists in the provided context, reply exactly:
+10. Remove the extra asterisks where ever not necessary.
+11. If absolutely no relevant information exists in the provided context, reply exactly:
 
 Answer not found in MFD lecture materials please try a different query
 
