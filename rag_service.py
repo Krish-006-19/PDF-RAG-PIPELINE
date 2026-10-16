@@ -431,11 +431,11 @@ def answer_user_query(query: str) -> dict:
     return {
         "ans": answer,
         "link": reference_link,
-        "sources": [
-            {
-                "content": doc.page_content,
-                "metadata": doc.metadata,
-            }
-            for doc in docs
-        ],
+        # "sources": [
+        #     {
+        #         "content": doc.page_content,
+        #         "metadata": doc.metadata,
+        #     }
+        #     for doc in docs
+        # ],
     }
