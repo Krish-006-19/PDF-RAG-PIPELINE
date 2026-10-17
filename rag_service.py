@@ -1,8 +1,10 @@
+import hashlib
+import json
 import re
 import uuid
 
 import math
-
+from redisSetup import redis
 from google import genai
 from google.genai import types
 from langchain_core.embeddings import Embeddings
@@ -31,6 +33,13 @@ from settings import (
 SIMILARITY_THRESHOLD = 0.70
 TOP_K = 8
 FINAL_CONTEXT_DOCS = 3
+
+# Redis answer-cache settings. Cached answers expire after one hour.
+ANSWER_CACHE_TTL_SECONDS = 60 * 60
+CACHE_VERSION = "v1"
+CACHE_GENERATION_KEY = (
+    f"rag:cache-generation:{get_pinecone_index_name()}:{get_pinecone_namespace()}"
+)
 
 EMBEDDING_DIMENSION = get_pinecone_dimension()
 EMBEDDING_MODEL = get_gemini_embedding_model()
@@ -149,6 +158,87 @@ def clean_query(query: str) -> str:
     query = re.sub(r"\s+", " ", query)
 
     return query
+
+
+def _get_cache_generation() -> str | None:
+    """Return the corpus generation, or None when Redis is unavailable."""
+    if redis is None:
+        return None
+
+    try:
+        generation = redis.get(CACHE_GENERATION_KEY)
+        return str(generation) if generation is not None else "0"
+    except Exception as exc:
+        print(f"Redis cache-version read failed: {exc}")
+        return None
+
+
+def _get_answer_cache_key(cleaned_query: str, generation: str | None) -> str | None:
+    """Create a namespaced cache key; bypass caching if Redis is unavailable."""
+    if generation is None:
+        return None
+
+    cache_identity = {
+        "version": CACHE_VERSION,
+        "index": get_pinecone_index_name(),
+        "namespace": get_pinecone_namespace(),
+        "generation": generation,
+        "model": MODEL_NAME,
+        "query": cleaned_query,
+    }
+    digest = hashlib.sha256(
+        json.dumps(cache_identity, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return f"rag:answer:{digest}"
+
+
+def _read_cached_answer(cache_key: str | None) -> dict | None:
+    if redis is None or cache_key is None:
+        return None
+
+    try:
+        cached = redis.get(cache_key)
+        if cached is None:
+            return None
+
+        # Redis normally returns the serialized string; tolerate a decoded
+        # mapping too, so a cache format change fails safely.
+        payload = json.loads(cached) if isinstance(cached, str) else cached
+        if isinstance(payload, dict) and {"ans", "link", "sources"}.issubset(payload):
+            print("Redis answer cache HIT")
+            return payload
+    except Exception as exc:
+        print(f"Redis cache read failed: {exc}")
+
+    return None
+
+
+def _write_cached_answer(cache_key: str | None, result: dict) -> None:
+    if redis is None or cache_key is None:
+        return
+
+    try:
+        redis.set(
+            cache_key,
+            json.dumps(result, ensure_ascii=False),
+            ex=ANSWER_CACHE_TTL_SECONDS,
+        )
+        print("Redis answer cached")
+    except Exception as exc:
+        # Caching is an optimization. Redis outages must not break RAG responses.
+        print(f"Redis cache write failed: {exc}")
+
+
+def _bump_cache_generation() -> None:
+    """Invalidate earlier answers after the corpus is changed."""
+    if redis is None:
+        return
+
+    try:
+        redis.incr(CACHE_GENERATION_KEY)
+        print("Redis cache generation incremented")
+    except Exception as exc:
+        print(f"Redis cache invalidation failed: {exc}")
 
 # =========================================================
 # PINECONE HELPERS
@@ -288,6 +378,9 @@ def index_admin_document(
         ids=ids,
     )
 
+    # Make any answers cached against the previous document corpus unreachable.
+    _bump_cache_generation()
+
     print("\n=========== CHUNKS INDEXED ===========")
 
     for i, chunk in enumerate(chunks):
@@ -307,8 +400,6 @@ def index_admin_document(
 
 def answer_user_query(query: str) -> dict:
 
-    vectorstore = _get_vectorstore()
-
     cleaned_query = clean_query(query)
 
     print("\n=========== ORIGINAL QUERY ===========")
@@ -316,6 +407,17 @@ def answer_user_query(query: str) -> dict:
 
     print("\n=========== CLEANED QUERY ===========")
     print(cleaned_query)
+
+    # Redis cache check happens before initializing Pinecone or calling Gemini.
+    generation = _get_cache_generation()
+    cache_key = _get_answer_cache_key(cleaned_query, generation)
+    cached_answer = _read_cached_answer(cache_key)
+    if cached_answer is not None:
+        return cached_answer
+
+    print("Redis answer cache MISS (or cache unavailable)")
+
+    vectorstore = _get_vectorstore()
 
     # =====================================================
     # RETRIEVAL
@@ -359,7 +461,7 @@ def answer_user_query(query: str) -> dict:
 
     if not docs:
 
-        return {
+        result = {
             "ans": (
                 "Answer not found in uploaded "
                 "documents please try a different query"
@@ -367,6 +469,8 @@ def answer_user_query(query: str) -> dict:
             "link": None,
             "sources": [],
         }
+        _write_cached_answer(cache_key, result)
+        return result
 
     # =====================================================
     # LIMIT CONTEXT
@@ -428,7 +532,7 @@ def answer_user_query(query: str) -> dict:
         docs[0].metadata or {}
     ).get("link")
 
-    return {
+    result = {
         "ans": answer,
         "link": reference_link,
         "sources": [
@@ -439,3 +543,6 @@ def answer_user_query(query: str) -> dict:
             for doc in docs
         ],
     }
+
+    _write_cached_answer(cache_key, result)
+    return result
