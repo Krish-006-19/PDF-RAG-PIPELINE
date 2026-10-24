@@ -24,14 +24,14 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
-@app.post("/transcript")
-def upload_document(payload: AdminDocument):
-    try:
-        return index_admin_document(text=payload.text, link=payload.link)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.post("/transcript")
+# def upload_document(payload: AdminDocument):
+#     try:
+#         return index_admin_document(text=payload.text, link=payload.link)
+#     except ValueError as e:
+#         raise HTTPException(status_code=400, detail=str(e))
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/query")
